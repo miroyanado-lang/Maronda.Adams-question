@@ -1,0 +1,578 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>MARONDA: ADAMS QUEST</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body, html { width: 100%; height: 100%; overflow: hidden; background-color: #0c1726; font-family: 'Courier New', monospace; user-select: none; }
+        canvas { display: block; width: 100vw; height: 100vh; image-rendering: pixelated; }
+        
+        /* Стили мобильного управления */
+        .mobile-btn {
+            position: absolute;
+            bottom: 30px;
+            width: 70px;
+            height: 70px;
+            background: rgba(31, 20, 45, 0.85);
+            border: 4px solid #82539c;
+            color: #fff;
+            font-size: 28px;
+            font-weight: bold;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            z-index: 20;
+            touch-action: none;
+            user-select: none;
+        }
+        .mobile-btn:active {
+            background: #00ffcc;
+            color: #1f142d;
+            border-color: #fff;
+        }
+        #btnLeft { left: 20px; }
+        #btnRight { left: 110px; }
+        #btnJump { right: 110px; }
+        #btnFire { right: 20px; border-color: #ff3366; }
+
+        @media (min-width: 1024px) {
+            .mobile-btn { display: none !important; }
+        }
+    </style>
+</head>
+<body>
+
+    <!-- Мобильные кнопки -->
+    <div id="btnLeft" class="mobile-btn">◀</div>
+    <div id="btnRight" class="mobile-btn">▶</div>
+    <div id="btnJump" class="mobile-btn">▲</div>
+    <div id="btnFire" class="mobile-btn">🔥</div>
+
+    <canvas id="gameCanvas"></canvas>
+
+    <script>
+        const canvas = document.getElementById("gameCanvas");
+        const ctx = canvas.getContext("2d");
+
+        // --- ЗВУКОВОЙ ДВИЖОК ---
+        const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        function playSound(type) {
+            if (audioCtx.state === 'suspended') audioCtx.resume();
+            const osc = audioCtx.createOscillator();
+            const gain = audioCtx.createGain();
+            osc.connect(gain); gain.connect(audioCtx.destination);
+
+            if (type === 'jump') {
+                osc.type = 'triangle'; osc.frequency.setValueAtTime(140, audioCtx.currentTime);
+                osc.frequency.exponentialRampToValueAtTime(440, audioCtx.currentTime + 0.12);
+                gain.gain.setValueAtTime(0.1, audioCtx.currentTime); osc.start(); osc.stop(audioCtx.currentTime + 0.12);
+            } else if (type === 'shoot') {
+                osc.type = 'sine'; osc.frequency.setValueAtTime(500, audioCtx.currentTime);
+                osc.frequency.exponentialRampToValueAtTime(150, audioCtx.currentTime + 0.1);
+                gain.gain.setValueAtTime(0.06, audioCtx.currentTime); osc.start(); osc.stop(audioCtx.currentTime + 0.1);
+            } else if (type === 'hit') {
+                osc.type = 'sawtooth'; osc.frequency.setValueAtTime(120, audioCtx.currentTime);
+                osc.frequency.linearRampToValueAtTime(60, audioCtx.currentTime + 0.08);
+                gain.gain.setValueAtTime(0.1, audioCtx.currentTime); osc.start(); osc.stop(audioCtx.currentTime + 0.08);
+            } else if (type === 'heal') {
+                osc.type = 'sine'; osc.frequency.setValueAtTime(400, audioCtx.currentTime);
+                osc.frequency.exponentialRampToValueAtTime(800, audioCtx.currentTime + 0.25);
+                gain.gain.setValueAtTime(0.08, audioCtx.currentTime); osc.start(); osc.stop(audioCtx.currentTime + 0.25);
+            } else if (type === 'death') {
+                osc.type = 'sawtooth'; osc.frequency.setValueAtTime(180, audioCtx.currentTime);
+                osc.frequency.linearRampToValueAtTime(20, audioCtx.currentTime + 0.5);
+                gain.gain.setValueAtTime(0.2, audioCtx.currentTime); osc.start(); osc.stop(audioCtx.currentTime + 0.5);
+            }
+        }
+
+        function resizeCanvas() {
+            canvas.width = window.innerWidth;
+            canvas.height = window.innerHeight;
+            groundY = Math.floor(canvas.height * 0.75);
+            updatePositions();
+        }
+
+        let gameState = 'MENU'; // MENU, PLAYING, TRANSITION, GAMEOVER, VICTORY
+        let currentWorld = 1; 
+        let gravity = 0.6;
+        let groundY = 0;
+        let menuAnimateTimer = 0;
+        let globalAnimTimer = 0;
+        
+        let mapWidth = 3000; // Увеличенная длина уровня
+        let cameraX = 0;
+        let playerName = "Maronde";
+        let typingActive = false;
+
+        let isSpawningTransition = false;
+        let spawnTransitionTimer = 0;
+        let playerSpawnAlpha = 0;
+
+        let mouseX = 0, mouseY = 0;
+        window.addEventListener('mousemove', (e) => { mouseX = e.clientX; mouseY = e.clientY; });
+
+        // Декорации заставки (парящие облака)
+        let menuClouds = [{x: 100, y: 80, s: 1.5}, {x: 500, y: 140, s: 0.8}, {x: 900, y: 60, s: 1.2}];
+
+        // Игрок
+        const player = {
+            x: 200, y: 0, size: 44, 
+            xSpeed: 0, ySpeed: 0, maxSpeed: 6.5, accel: 0.5, friction: 0.85,
+            jumpForce: -13.5, isGrounded: false, direction: 1,
+            hp: 100, maxHp: 100, animFrame: 0, isMoving: false, hurtTimer: 0
+        };
+
+        // Враг (Босс)
+        const boss = { x: 1200, y: 150, size: 120, hp: 200, maxHp: 200, shootTimer: 0, moveTimer: 0 };
+
+        // Помощник Адам
+        const adam = { name: "Адам", x: 100, y: 0, size: 44, speed: 3.5, auraRad: 150, direction: 1, isMoving: false, animFrame: 0 };
+
+        let portal = { x: 2700, y: 0, width: 70, height: 120 }; // Портал сдвинут дальше в конец карты
+
+        let startBtn = { x: 0, y: 0, w: 280, h: 55 };
+        let nameBox = { x: 0, y: 0, w: 240, h: 45 };
+        let menuBtn = { x: 0, y: 0, w: 200, h: 50 };
+
+        let obstacles = [];
+        let bossProjectiles = [];
+        let playerProjectiles = [];
+        let healParticles = [];
+
+        function updatePositions() {
+            startBtn.x = canvas.width / 2 - startBtn.w / 2;
+            startBtn.y = canvas.height * 0.65;
+            nameBox.x = canvas.width / 2 - nameBox.w / 2;
+            nameBox.y = canvas.height * 0.50;
+            menuBtn.x = canvas.width / 2 - menuBtn.w / 2;
+            menuBtn.y = canvas.height * 0.65;
+        }
+
+        resizeCanvas();
+        window.addEventListener('resize', resizeCanvas);
+
+        // --- МОБИЛЬНОЕ УПРАВЛЕНИЕ ---
+        const mobileKeys = { left: false, right: false, jump: false };
+        document.getElementById("btnLeft").addEventListener("touchstart", (e) => { e.preventDefault(); mobileKeys.left = true; });
+        document.getElementById("btnLeft").addEventListener("touchend", (e) => { e.preventDefault(); mobileKeys.left = false; });
+        document.getElementById("btnRight").addEventListener("touchstart", (e) => { e.preventDefault(); mobileKeys.right = true; });
+        document.getElementById("btnRight").addEventListener("touchend", (e) => { e.preventDefault(); mobileKeys.right = false; });
+        document.getElementById("btnJump").addEventListener("touchstart", (e) => { e.preventDefault(); mobileKeys.jump = true; });
+        document.getElementById("btnJump").addEventListener("touchend", (e) => { e.preventDefault(); mobileKeys.jump = false; });
+
+        document.getElementById("btnFire").addEventListener("touchstart", (e) => { 
+            e.preventDefault();
+            if (gameState === 'PLAYING' && !isSpawningTransition) {
+                playSound('shoot');
+                let pX = player.x + player.size / 2; let pY = player.y + player.size / 2;
+                let bX = boss.x + boss.size / 2; let bY = boss.y + boss.size / 2;
+                let diffX = bX - pX; let diffY = bY - pY; let dist = Math.sqrt(diffX*diffX + diffY*diffY);
+                playerProjectiles.push({ x: pX, y: pY, size: 10, xSpeed: (diffX / dist) * 15, ySpeed: (diffY / dist) * 15 });
+            }
+        });
+
+        // Клавиатура (ПК) + Ввод имени
+        const keys = { ArrowLeft: false, ArrowRight: false, KeyA: false, KeyD: false, ArrowUp: false, Space: false, KeyW: false };
+        window.addEventListener("keydown", (e) => { 
+            if (gameState === 'MENU') {
+                if (typingActive) {
+                    if (e.key === 'Backspace') { playerName = playerName.slice(0, -1); }
+                    else if (e.key === 'Enter') { typingActive = false; }
+                    else if (e.key.length === 1 && playerName.length < 12) { playerName += e.key; }
+                    return;
+                }
+                if (e.code === 'Enter' || e.code === 'Space') startGame();
+            }
+            if (e.code in keys) keys[e.code] = true; 
+            if ((gameState === 'GAMEOVER' || gameState === 'VICTORY') && e.code === 'Space') { gameState = 'MENU'; } 
+        });
+        window.addEventListener("keyup", (e) => { if (e.code in keys) keys[e.code] = false; });
+
+        canvas.addEventListener("mousedown", (e) => {
+            const rect = canvas.getBoundingClientRect();
+            const mX = e.clientX - rect.left;
+            const mY = e.clientY - rect.top;
+
+            if (gameState === 'MENU') {
+                if (mX >= nameBox.x && mX <= nameBox.x + nameBox.w && mY >= nameBox.y && mY <= nameBox.y + nameBox.h) {
+                    typingActive = true;
+                } else {
+                    typingActive = false;
+                }
+                if (mX >= startBtn.x && mX <= startBtn.x + startBtn.w && mY >= startBtn.y && mY <= startBtn.y + startBtn.h) startGame();
+            } else if (gameState === 'PLAYING' && !isSpawningTransition) {
+                playSound('shoot');
+                let worldMouseX = mX + cameraX; let worldMouseY = mY;
+                let pX = player.x + player.size / 2; let pY = player.y + player.size / 2;
+                let diffX = worldMouseX - pX; let diffY = worldMouseY - pY; let dist = Math.sqrt(diffX*diffX + diffY*diffY);
+                playerProjectiles.push({ x: pX, y: pY, size: 10, xSpeed: (diffX / dist) * 15, ySpeed: (diffY / dist) * 15 });
+            } else if (gameState === 'GAMEOVER' || gameState === 'VICTORY') {
+                if (mX >= menuBtn.x && mX <= menuBtn.x + menuBtn.w && mY >= menuBtn.y && mY <= menuBtn.y + menuBtn.h) { gameState = 'MENU'; }
+            }
+        });
+
+        function startGame() {
+            currentWorld = 1;
+            setupWorld();
+            gameState = 'PLAYING';
+        }
+
+        function setupWorld() {
+            player.hp = player.maxHp;
+            player.x = 200; player.y = groundY - player.size;
+            player.xSpeed = 0; player.ySpeed = 0;
+            cameraX = 0;
+            bossProjectiles = []; playerProjectiles = []; healParticles = [];
+            
+            boss.shootTimer = 0;
+            boss.moveTimer = 0;
+
+            if (currentWorld === 1) {
+                boss.hp = 200; boss.maxHp = 200; boss.x = 1200; boss.y = 150;
+                obstacles = [
+                    { x: 600, y: groundY, width: 50, height: 50 },
+                    { x: 1200, y: groundY, width: 50, height: 60 },
+                    { x: 1800, y: groundY, width: 50, height: 50 },
+                    { x: 2300, y: groundY, width: 50, height: 70 }
+                ];
+            } else if (currentWorld === 2) {
+                boss.hp = 350; boss.maxHp = 350; boss.x = 1400; boss.y = 130;
+                adam.x = player.x - 60; adam.y = groundY - adam.size;
+                obstacles = [
+                    { x: 500, y: groundY, width: 50, height: 60 },
+                    { x: 1000, y: groundY, width: 50, height: 70 },
+                    { x: 1600, y: groundY, width: 50, height: 60 },
+                    { x: 2100, y: groundY, width: 50, height: 80 }
+                ];
+            } else if (currentWorld === 3) {
+                boss.hp = 500; boss.maxHp = 500; boss.x = 1500; boss.y = 120;
+                adam.x = player.x - 60; adam.y = groundY - adam.size;
+                obstacles = [
+                    { x: 400, y: groundY, width: 55, height: 65 },
+                    { x: 900, y: groundY, width: 55, height: 75 },
+                    { x: 1500, y: groundY, width: 55, height: 65 },
+                    { x: 2000, y: groundY, width: 55, height: 85 }
+                ];
+            } else if (currentWorld === 4) {
+                boss.hp = 800; boss.maxHp = 800; boss.x = 1600; boss.y = 100;
+                adam.x = player.x - 60; adam.y = groundY - adam.size;
+                obstacles = [
+                    { x: 400, y: groundY, width: 60, height: 70 },
+                    { x: 800, y: groundY, width: 60, height: 80 },
+                    { x: 1300, y: groundY, width: 60, height: 70 },
+                    { x: 1800, y: groundY, width: 60, height: 90 },
+                    { x: 2300, y: groundY, width: 60, height: 80 }
+                ];
+            }
+        }
+
+        function nextWorldTransition() {
+            isSpawningTransition = true;
+            spawnTransitionTimer = 0;
+            playerSpawnAlpha = 0;
+            playSound('heal');
+            currentWorld++;
+            setupWorld();
+        }
+
+        // --- ТЕКСТУРЫ И РИСОВАНИЕ ---
+        function drawPixelGround(wX, gY, mapW) {
+            ctx.save();
+            let step = 8;
+            ctx.fillStyle = (currentWorld === 1) ? "#2b632b" : (currentWorld === 2) ? "#4a1257" : (currentWorld === 3) ? "#1f2d3d" : "#4a0d0d"; 
+            ctx.fillRect(wX, gY, mapW, step * 2);
+            ctx.fillStyle = (currentWorld === 1) ? "#1b421b" : (currentWorld === 2) ? "#2a0933" : (currentWorld === 3) ? "#0f161e" : "#240404";
+            for (let i = wX; i < wX + mapW; i += step * 3) { ctx.fillRect(i, gY + step * 2, step, step); }
+            ctx.fillStyle = (currentWorld === 1) ? "#3b230f" : (currentWorld === 2) ? "#13041a" : (currentWorld === 3) ? "#0d1117" : "#140202";
+            ctx.fillRect(wX, gY + step * 3, mapW, canvas.height - gY);
+            ctx.restore();
+        }
+
+        function drawPixelSpike(x, y, w, h) {
+            ctx.save(); let step = 6;
+            ctx.fillStyle = "#444455"; ctx.fillRect(x, y - step, w, step);
+            ctx.fillStyle = (currentWorld === 1) ? "#777788" : (currentWorld === 2) ? "#9922bb" : (currentWorld === 3) ? "#51759e" : "#ff3333";
+            let center = x + w / 2;
+            for (let i = 0; i < h; i += step) { let widthAtY = w * (1 - i / h); ctx.fillRect(center - widthAtY / 2, y - step - i, widthAtY, step); }
+            ctx.restore();
+        }
+
+        function drawPixelHelicopter(bx, by, size) {
+            ctx.save(); let p = Math.floor(size / 16); ctx.translate(bx, by);
+            ctx.fillStyle = (currentWorld === 1) ? "#2d3748" : "#224455"; ctx.fillRect(p*3, p*4, p*10, p*6); ctx.fillRect(p*13, p*5, p*4, p*2);
+            ctx.fillStyle = "#00e5ff"; ctx.fillRect(p*1, p*5, p*3, p*3);
+            ctx.fillStyle = "#1a202c"; ctx.fillRect(p*4, p*10, p*2, p*2); ctx.fillRect(p*9, p*10, p*2, p*2); ctx.fillRect(p*3, p*12, p*9, p*1);
+            ctx.fillStyle = "#e2e8f0"; ctx.fillRect(p*7, p*2, p*2, p*2);
+            if (Math.floor(globalAnimTimer * 12) % 2 === 0) { ctx.fillRect(p*1, p*1, p*14, p*1); } else { ctx.fillRect(p*5, p*1, p*6, p*1); }
+            ctx.restore();
+        }
+
+        function drawPixelEye(bx, by, size) {
+            ctx.save(); let p = Math.floor(size / 12); ctx.translate(bx, by);
+            ctx.fillStyle = "#f0f0f0"; ctx.fillRect(p*2, p*2, p*8, p*8); ctx.fillRect(p*4, p*1, p*4, p*10); ctx.fillRect(p*1, p*4, p*10, p*4);
+            ctx.fillStyle = (currentWorld === 4) ? "#ff1111" : "#cc1111";
+            if (Math.floor(globalAnimTimer * 6) % 2 === 0) { ctx.fillRect(0, p*5, p*2, p*2); ctx.fillRect(p*10, p*5, p*2, p*2); }
+            ctx.fillStyle = (currentWorld === 4) ? "#ff0055" : "#9400d3"; ctx.fillRect(p*4, p*4, p*4, p*4);
+            ctx.fillStyle = "#000000"; ctx.fillRect(p*5, p*5, p*2, p*2);
+            ctx.fillStyle = "#ffffff"; ctx.fillRect(p*5, p*5, p*1, p*1);
+            ctx.restore();
+        }
+
+        function drawPixelPlayer(x, y, size, dir, isGrounded, isMoving, animFrame, hurt, alpha = 1) {
+            let p = size / 8; ctx.save(); ctx.globalAlpha = alpha;
+            if (dir === -1) { ctx.translate(x + size, y); ctx.scale(-1, 1); x = 0; y = 0; }
+            if (hurt > 0 && Math.floor(globalAnimTimer * 5) % 2 === 0) ctx.globalAlpha = 0.3;
+            ctx.fillStyle = "#3b1e08"; ctx.fillRect(x + p, y, p * 6, p * 2);
+            ctx.fillStyle = "#ffcc99"; ctx.fillRect(x + p, y + p * 2, p * 6, p * 3);
+            ctx.fillStyle = "#000"; ctx.fillRect(x + p * 5, y + p * 2, p, p);
+            ctx.fillStyle = "#cc2222"; ctx.fillRect(x + p, y + p * 5, p * 6, p * 2);
+            ctx.fillStyle = "#2244cc";
+            let legOffset = Math.sin(animFrame * 0.4) * p;
+            if (isGrounded && isMoving) { ctx.fillRect(x + p * 1.5 + legOffset, y + p * 7, p * 1.5, p); ctx.fillRect(x + p * 4.5 - legOffset, y + p * 7, p * 1.5, p); }
+            else { ctx.fillRect(x + p * 2, y + p * 7, p * 4, p); }
+            ctx.restore();
+        }
+
+        function drawAdam(npc) {
+            let p = npc.size / 8; let x = npc.x; let y = npc.y; ctx.save();
+            if (npc.direction === -1) { ctx.translate(x + npc.size, y); ctx.scale(-1, 1); x = 0; y = 0; }
+            ctx.fillStyle = "#0f7535"; ctx.fillRect(x + p, y, p * 6, p * 2);
+            ctx.fillStyle = "#ffddbb"; ctx.fillRect(x + p, y + p * 2, p * 6, p * 3);
+            ctx.fillStyle = "#0055ff"; ctx.fillRect(x + p * 5, y + p * 2, p, p);
+            ctx.fillStyle = "#1b9c4b"; ctx.fillRect(x + p, y + p * 5, p * 6, p * 2);
+            ctx.fillStyle = "#ffaa00"; ctx.fillRect(x + p * 2, y + p * 7, p * 4, p);
+            ctx.restore();
+
+            ctx.save(); ctx.fillStyle = "rgba(0, 0, 0, 0.85)"; ctx.strokeStyle = "#00ffcc"; ctx.lineWidth = 3;
+            let boxW = 340, boxH = 55; let boxX = npc.x - boxW/2 + npc.size/2; let boxY = npc.y - 75;
+            ctx.fillRect(boxX, boxY, boxW, boxH); ctx.strokeRect(boxX, boxY, boxW, boxH);
+            ctx.fillStyle = "#fff"; ctx.font = "bold 11px 'Courier New'"; ctx.textAlign = "center";
+            ctx.fillText("Привет, меня зовут Адам, и я хочу тебе помочь,", boxX + boxW/2, boxY + 22);
+            ctx.fillStyle = "#00ffcc"; ctx.fillText("давай одолеем этих тварей вместе!", boxX + boxW/2, boxY + 40);
+            ctx.restore();
+        }
+
+        // --- ОБНОВЛЕНИЕ ИГРЫ ОДНИМ ЦИКЛОМ ---
+        function update() {
+            globalAnimTimer += 0.03;
+            
+            if (gameState === 'MENU') {
+                menuAnimateTimer += 0.03;
+                menuClouds.forEach(c => { c.x += c.s * 0.5; if (c.x > canvas.width) c.x = -150; });
+                return;
+            }
+            if (gameState !== 'PLAYING') return;
+
+            if (isSpawningTransition) {
+                spawnTransitionTimer++; playerSpawnAlpha = Math.min(1, spawnTransitionTimer / 90);
+                if (spawnTransitionTimer >= 90) isSpawningTransition = false;
+                return;
+            }
+
+            if (player.hurtTimer > 0) player.hurtTimer--;
+
+            // Движение
+            player.isMoving = false;
+            if (keys.ArrowLeft || keys.KeyA || mobileKeys.left) { player.xSpeed -= player.accel; player.direction = -1; player.isMoving = true; }
+            else if (keys.ArrowRight || keys.KeyD || mobileKeys.right) { player.xSpeed += player.accel; player.direction = 1; player.isMoving = true; }
+            else { player.xSpeed *= player.friction; }
+
+            player.animFrame = player.isMoving ? player.animFrame + 1 : 0;
+            if (player.xSpeed > player.maxSpeed) player.xSpeed = player.maxSpeed;
+            if (player.xSpeed < -player.maxSpeed) player.xSpeed = -player.maxSpeed;
+
+            if ((keys.ArrowUp || keys.Space || keys.KeyW || mobileKeys.jump) && player.isGrounded) {
+                player.ySpeed = player.jumpForce; player.isGrounded = false; playSound('jump');
+            }
+            player.ySpeed += gravity; player.x += player.xSpeed; player.y += player.ySpeed;
+
+            if (player.x < 0) player.x = 0; if (player.x > mapWidth - player.size) player.x = mapWidth - player.size;
+            if (player.y >= groundY - player.size) { player.y = groundY - player.size; player.ySpeed = 0; player.isGrounded = true; }
+
+            // Переход между мирами
+            if (player.x + player.size > portal.x && player.x < portal.x + portal.width) {
+                if (currentWorld < 4) { nextWorldTransition(); } else { gameState = 'VICTORY'; }
+                return;
+            }
+
+            // Логика Адама (со 2-го мира)
+            if (currentWorld >= 2) {
+                let distToPlayer = player.x - adam.x;
+                if (Math.abs(distToPlayer) > 70) { adam.direction = distToPlayer > 0 ? 1 : -1; adam.x += adam.direction * adam.speed; }
+                if (Math.floor(globalAnimTimer * 10) % 20 === 0 && player.hp < player.maxHp) {
+                    player.hp = Math.min(player.maxHp, player.hp + 2);
+                    healParticles.push({ x: player.x + Math.random()*player.size, y: player.y, vy: -2, alpha: 1 });
+                }
+                for (let i = healParticles.length - 1; i >= 0; i--) {
+                    healParticles[i].y += healParticles[i].vy; healParticles[i].alpha -= 0.04;
+                    if (healParticles[i].alpha <= 0) healParticles.splice(i, 1);
+                }
+            }
+
+            // Камера
+            let targetCameraX = player.x - canvas.width / 2; cameraX += (targetCameraX - cameraX) * 0.1;
+            if (cameraX < 0) cameraX = 0; if (cameraX > mapWidth - canvas.width) cameraX = mapWidth - canvas.width;
+
+            // ИИ боссов
+            boss.moveTimer += 0.02;
+            let targetBossX = player.x + (player.direction * 200);
+            let targetBossY = player.y - 220 + Math.sin(boss.moveTimer) * 40;
+            boss.x += (targetBossX - boss.x) * 0.03; boss.y += (targetBossY - boss.y) * 0.03;
+
+            boss.shootTimer++;
+            let currentBossCooldown = currentWorld === 1 ? 70 : currentWorld === 2 ? 55 : currentWorld === 3 ? 45 : 30;
+            if (boss.shootTimer > currentBossCooldown) {
+                let bX = boss.x + boss.size / 2; let bY = boss.y + boss.size / 2;
+                let pX = player.x + player.size / 2; let pY = player.y + player.size / 2;
+                let diffX = pX - bX; let diffY = pY - bY; let dist = Math.sqrt(diffX * diffX + diffY * diffY);
+                bossProjectiles.push({ x: bX, y: bY, size: 12, xSpeed: (diffX / dist) * (5 + currentWorld), ySpeed: (diffY / dist) * (5 + currentWorld) });
+                boss.shootTimer = 0;
+            }
+
+            // Снаряды игрока
+            for (let i = playerProjectiles.length - 1; i >= 0; i--) {
+                playerProjectiles[i].x += playerProjectiles[i].xSpeed; playerProjectiles[i].y += playerProjectiles[i].ySpeed;
+                if (playerProjectiles[i].x > boss.x && playerProjectiles[i].x < boss.x + boss.size && playerProjectiles[i].y > boss.y && playerProjectiles[i].y < boss.y + boss.size) {
+                    boss.hp -= 10; playSound('hit'); playerProjectiles.splice(i, 1);
+                    if (boss.hp <= 0) { boss.hp = 0; } continue;
+                }
+                if (playerProjectiles[i].x < 0 || playerProjectiles[i].x > mapWidth) playerProjectiles.splice(i, 1);
+            }
+
+            // Столкновения
+            obstacles.forEach(obs => {
+                if (player.x + 5 < obs.x + obs.width && player.x + player.size - 5 > obs.x && player.y < obs.y && player.y + player.size > obs.y - obs.height) takeDamage(15);
+            });
+
+            for (let i = bossProjectiles.length - 1; i >= 0; i--) {
+                bossProjectiles[i].x += bossProjectiles[i].xSpeed; bossProjectiles[i].y += bossProjectiles[i].ySpeed;
+                if (player.x < bossProjectiles[i].x + bossProjectiles[i].size && player.x + player.size > bossProjectiles[i].x && player.y < bossProjectiles[i].y + bossProjectiles[i].size && player.y + player.size > bossProjectiles[i].y) {
+                    takeDamage(10); bossProjectiles.splice(i, 1);
+                }
+                if (bossProjectiles[i] && (bossProjectiles[i].x < 0 || bossProjectiles[i].x > mapWidth)) bossProjectiles.splice(i, 1);
+            }
+        }
+
+        function takeDamage(amount) {
+            if (player.hurtTimer > 0 || isSpawningTransition) return;
+            player.hp -= amount; player.hurtTimer = 30; playSound('hit');
+            if (player.hp <= 0) { gameState = 'GAMEOVER'; playSound('death'); }
+        }
+
+        // --- ОТРИСОВКА ЭКРАНА ---
+        function draw() {
+            // ЗАСТАВКА ВНУТРИ ХОЛСТА (РЕШЕНО НА 100%)
+            if (gameState === 'MENU') {
+                ctx.fillStyle = "#0c1726"; ctx.fillRect(0, 0, canvas.width, canvas.height); 
+
+                // Солнце на фоне
+                ctx.fillStyle = "#ffffaa"; ctx.beginPath(); ctx.arc(canvas.width * 0.75, canvas.height * 0.22, 45, 0, Math.PI*2); ctx.fill();
+
+                // Облака
+                ctx.fillStyle = "rgba(255,255,255,0.1)";
+                menuClouds.forEach(c => { ctx.fillRect(c.x, c.y, 120, 25); ctx.fillRect(c.x + 20, c.y - 10, 80, 15); });
+
+                // Горы
+                ctx.fillStyle = "#18233c"; ctx.beginPath(); ctx.moveTo(0, canvas.height); ctx.lineTo(canvas.width * 0.25, canvas.height * 0.45); ctx.lineTo(canvas.width * 0.6, canvas.height); ctx.lineTo(canvas.width * 0.85, canvas.height * 0.4); ctx.lineTo(canvas.width, canvas.height); ctx.fill();
+
+                updatePositions();
+                let menuYOffset = Math.floor(Math.sin(menuAnimateTimer) * 8);
+                
+                // Название
+                ctx.textAlign = "center"; ctx.font = "bold 36px 'Courier New'";
+                ctx.fillStyle = "#000"; ctx.fillText("MARONDA: ADAMS QUEST", canvas.width / 2 + 4, canvas.height * 0.25 + menuYOffset + 4);
+                ctx.fillStyle = "#00ffcc"; ctx.fillText("MARONDA: ADAMS QUEST", canvas.width / 2, canvas.height * 0.25 + menuYOffset);
+
+                // Поле ввода имени (Пиксельное на холсте)
+                ctx.fillStyle = typingActive ? "#2a193d" : "#1f142d";
+                ctx.fillRect(nameBox.x, nameBox.y, nameBox.w, nameBox.h);
+                ctx.strokeStyle = typingActive ? "#00ffcc" : "#82539c"; ctx.lineWidth = 4; ctx.strokeRect(nameBox.x, nameBox.y, nameBox.w, nameBox.h);
+                ctx.fillStyle = "#fff"; ctx.font = "bold 14px 'Courier New'";
+                ctx.fillText(playerName + (typingActive && Math.floor(globalAnimTimer * 3) % 2 === 0 ? "_" : ""), nameBox.x + nameBox.w / 2, nameBox.y + 27);
+                ctx.fillStyle = "#82539c"; ctx.font = "11px 'Courier New'"; ctx.fillText("КЛИКНИТЕ, ЧТОБЫ ИЗМЕНИТЬ ИМЯ", nameBox.x + nameBox.w / 2, nameBox.y - 10);
+
+                // Кнопка Старт
+                ctx.fillStyle = "#341c4f"; ctx.fillRect(startBtn.x, startBtn.y, startBtn.w, startBtn.h);
+                ctx.strokeStyle = "#82539c"; ctx.lineWidth = 4; ctx.strokeRect(startBtn.x, startBtn.y, startBtn.w, startBtn.h);
+                ctx.fillStyle = "#fff"; ctx.font = "bold 14px 'Courier New'"; ctx.fillText("НАЧАТЬ ПРИКЛЮЧЕНИЕ", startBtn.x + startBtn.w / 2, startBtn.y + 33);
+            } else {
+                // ИГРОВОЙ МИР
+                ctx.fillStyle = (currentWorld === 1) ? "#070c14" : (currentWorld === 2) ? "#13051c" : (currentWorld === 3) ? "#0a1017" : "#120101"; 
+                ctx.fillRect(0, 0, canvas.width, canvas.height); 
+
+                ctx.save(); ctx.translate(-cameraX, 0);
+                drawPixelGround(0, groundY, mapWidth);
+
+                // Рисуем финишный портал
+                ctx.fillStyle = "#00e5ff"; ctx.fillRect(portal.x, portal.y - portal.height, portal.width, portal.height);
+
+                if (currentWorld >= 2) {
+                    healParticles.forEach(p => { ctx.fillStyle = `rgba(0, 255, 200, ${p.alpha})`; ctx.fillRect(Math.floor(p.x), Math.floor(p.y), 6, 6); });
+                    drawAdam(adam);
+                }
+
+                obstacles.forEach(obs => drawPixelSpike(obs.x, obs.y, obs.width, obs.height)); 
+
+                let currentAlpha = isSpawningTransition ? playerSpawnAlpha : 1;
+                drawPixelPlayer(player.x, player.y, player.size, player.direction, player.isGrounded, player.isMoving, player.animFrame, player.hurtTimer, currentAlpha); 
+                
+                if (currentWorld === 1 || currentWorld === 3) {
+                    drawPixelHelicopter(boss.x, boss.y, boss.size);
+                } else {
+                    drawPixelEye(boss.x, boss.y, boss.size); 
+                }
+
+                ctx.textAlign = "center"; ctx.fillStyle = "#00ffcc"; ctx.font = "bold 13px 'Courier New'";
+                ctx.fillText(playerName, player.x + player.size / 2, player.y - 12);
+
+                if (boss.hp > 0) {
+                    ctx.fillStyle = "#222"; ctx.fillRect(boss.x - 10, boss.y - 20, boss.size + 20, 10);
+                    ctx.fillStyle = "#ff2222"; ctx.fillRect(boss.x - 10, boss.y - 20, (boss.size + 20) * (boss.hp / boss.maxHp), 10);
+                } else {
+                    ctx.fillStyle = "#00ffcc"; ctx.font = "bold 12px 'Courier New'"; ctx.fillText("ПУТЬ СВОБОДЕН! БЕГИ В ПОРТАЛ!", boss.x + boss.size/2, boss.y + boss.size/2);
+                }
+
+                ctx.fillStyle = "#00ffcc"; playerProjectiles.forEach(proj => { ctx.fillRect(Math.floor(proj.x - 5), Math.floor(proj.y - 5), proj.size, proj.size); });
+                ctx.fillStyle = "#ff4444"; bossProjectiles.forEach(proj => { ctx.fillRect(Math.floor(proj.x), Math.floor(proj.y), proj.size, proj.size); });
+
+                ctx.restore();
+
+                // Прицел
+                ctx.strokeStyle = "#00ffcc"; ctx.lineWidth = 2; ctx.strokeRect(mouseX - 8, mouseY - 8, 16, 16);
+
+                // HUD интерфейс
+                ctx.textAlign = "left"; ctx.fillStyle = "#fff"; ctx.font = "bold 16px 'Courier New'";
+                let enemyName = currentWorld === 1 ? "ВЕРТОЛЕТ" : currentWorld === 2 ? "МЕРЗКИЙ ГЛАЗ" : currentWorld === 3 ? "КИБЕР-ДРОН" : "ДРЕВНИЙ ОКО";
+                ctx.fillText(`МИР ${currentWorld}/4 | ${enemyName}: ${boss.hp}/${boss.maxHp}`, 30, 40);
+                
+                ctx.fillStyle = "#222"; ctx.fillRect(30, 52, 180, 16);
+                ctx.fillStyle = "#ff3366"; ctx.fillRect(30, 52, 180 * (player.hp / player.maxHp), 16);
+
+                if (isSpawningTransition) {
+                    ctx.fillStyle = "rgba(5, 1, 10, 0.93)"; ctx.fillRect(0, 0, canvas.width, canvas.height);
+                    ctx.textAlign = "center"; ctx.fillStyle = "#00ffcc"; ctx.font = "bold 22px 'Courier New'";
+                    ctx.fillText(`ПРОЯВЛЕНИЕ В МИРЕ ${currentWorld}...`, canvas.width / 2, canvas.height / 2);
+                }
+
+                if (gameState === 'GAMEOVER') {
+                    ctx.fillStyle = "rgba(0,0,0,0.9)"; ctx.fillRect(0, 0, canvas.width, canvas.height);
+                    ctx.textAlign = "center"; ctx.fillStyle = "#ff3333"; ctx.font = "bold 36px 'Courier New'"; ctx.fillText("ВЫ ПОВЕРЖЕНЫ", canvas.width / 2, canvas.height * 0.35);
+                    ctx.fillStyle = "#341c4f"; ctx.fillRect(menuBtn.x, menuBtn.y, menuBtn.w, menuBtn.h);
+                    ctx.fillStyle = "#fff"; ctx.font = "bold 14px 'Courier New'"; ctx.fillText("В МЕНЮ", menuBtn.x + menuBtn.w / 2, menuBtn.y + 31);
+                } else if (gameState === 'VICTORY') {
+                    ctx.fillStyle = "rgba(0,0,0,0.9)"; ctx.fillRect(0, 0, canvas.width, canvas.height);
+                    ctx.textAlign = "center"; ctx.fillStyle = "#00ffcc"; ctx.font = "bold 32px 'Courier New'"; ctx.fillText("ВЫ И АДАМ СПАСЛИ МИР MARONDA!", canvas.width / 2, canvas.height * 0.35);
+                    ctx.fillStyle = "#341c4f"; ctx.fillRect(menuBtn.x, menuBtn.y, menuBtn.w, menuBtn.h);
+                    ctx.fillStyle = "#fff"; ctx.font = "bold 14px 'Courier New'"; ctx.fillText("В МЕНЮ", menuBtn.x + menuBtn.w / 2, menuBtn.y + 31);
+                }
+            }
+        }
+
+        function gameLoop() { update(); draw(); requestAnimationFrame(gameLoop); }
+        gameLoop();
+    </script>
+</body>
+</html>
+
